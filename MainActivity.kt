@@ -1,10 +1,7 @@
-// FaceDetector
-
 package com.example.faceid
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -24,6 +21,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,6 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -40,6 +39,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.faceid.coverage.FaceCoverageProgressUI
+import com.example.faceid.coverage.FaceCoverageTracker
 import com.example.faceid.ui.theme.FaceIDTheme
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
@@ -64,7 +65,7 @@ import kotlin.math.sqrt
 class MainActivity : ComponentActivity() {
 
     private val isCameraPermissionGranted = mutableStateOf(false)
-
+    private val tracker = FaceCoverageTracker()
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -106,7 +107,7 @@ class MainActivity : ComponentActivity() {
             FaceIDTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     if (isCameraPermissionGranted.value) {
-                        CameraWithHeadPose(modifier = Modifier.padding(innerPadding))
+                        CameraWithHeadPose(modifier = Modifier.padding(innerPadding), tracker = tracker)
                     } else {
                         Text(text = "Camera permission is required to use this app")
                     }
@@ -120,18 +121,22 @@ class MainActivity : ComponentActivity() {
 data class HeadPoseAngles(
     val pitch: Float = 0f,
     val yaw: Float = 0f,
-    val roll: Float = 0f
+    val roll: Float = 0f,
+    val distance: Float = 0f
 )
 
 @OptIn(ExperimentalGetImage::class)
 @Composable
-fun CameraWithHeadPose(modifier: Modifier = Modifier) {
+fun CameraWithHeadPose(modifier: Modifier = Modifier, tracker: FaceCoverageTracker) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
     var headPoseAngles by remember { mutableStateOf(HeadPoseAngles()) }
+    var distanceEnforce by remember { mutableStateOf("Ok") }
+    var boxColor by remember { mutableStateOf(Color.Red.copy(alpha = 0.5f)) }
+    var scanProgress by remember { mutableStateOf(0f) }
 
     val faceLandmarker = remember {
         try {
@@ -156,12 +161,13 @@ fun CameraWithHeadPose(modifier: Modifier = Modifier) {
 
     val faceModel3D = remember {
         MatOfPoint3f(
-            Point3(285.0, 528.0, 200.0),
-            Point3(285.0, 371.0, 152.0),
-            Point3(197.0, 574.0, 128.0),
-            Point3(173.0, 425.0, 108.0),
-            Point3(360.0, 574.0, 128.0),
-            Point3(391.0, 425.0, 108.0)
+            // Using standard facial anthropometry (measurements in millimeters)
+            Point3(0.0, 0.0, 0.0),              // Index 1: Nose tip (origin)
+            Point3(0.0, -50.0, -21.0),          // Index 9: Nose bridge (50mm above nose, 21mm back)
+            Point3(-31.5, 25.0, -26.0),         // Index 57: Left eye inner corner
+            Point3(-54.8, 20.0, -30.0),         // Index 130: Left eye outer corner
+            Point3(31.5, 25.0, -26.0),          // Index 287: Right eye inner corner
+            Point3(54.8, 20.0, -30.0)           // Index 359: Right eye outer corner
         )
     }
 
@@ -172,9 +178,9 @@ fun CameraWithHeadPose(modifier: Modifier = Modifier) {
         val z = atan2(m.get(1, 0)[0], m.get(0, 0)[0])
 
         return floatArrayOf(
-            (x * 180 / PI).toFloat(),
-            (y * 180 / PI).toFloat(),
-            (z * 180 / PI).toFloat()
+            (x * 180 / PI).toFloat(), // Pitch
+            (y * 180 / PI).toFloat(), // Yaw
+            (z * 180 / PI).toFloat() // Roll
         )
     }
 
@@ -250,12 +256,29 @@ fun CameraWithHeadPose(modifier: Modifier = Modifier) {
                                     Calib3d.Rodrigues(rotationVec, rotationMatrix)
                                     val angles = rotationMatrixToAngles(rotationMatrix)
 
+                                    // Getting the distance
+                                    val tz = translationVec.get(2, 0)[0]
+                                    val distance = tz
+                                    distanceEnforce = if (distance > 600) {
+                                        "GET CLOSER TO CAMERA"
+                                    } else if (distance < 270) {
+                                        "TOO CLOSE TO CAMERA"
+                                    } else {
+                                        "Ok"
+                                    }
+
                                     headPoseAngles = HeadPoseAngles(
                                         pitch = angles[0],
                                         yaw = angles[1],
-                                        roll = angles[2]
+                                        roll = angles[2],
+                                        distance = distance.toFloat()
                                     )
+                                    tracker.updateBins(yaw = angles[1], pitch = angles[0], roll = angles[2])
+                                    scanProgress = tracker.getCoveragePercentage() / 100f
 
+                                    if (tracker.getCoveragePercentage() >= 100) {
+                                        boxColor = Color.Green.copy(alpha = 0.5f)
+                                    }
                                     rotationMatrix.release()
                                 }
 
@@ -302,13 +325,21 @@ fun CameraWithHeadPose(modifier: Modifier = Modifier) {
             },
             modifier = Modifier.fillMaxSize()
         )
+        
+        FaceCoverageProgressUI(
+            progress = scanProgress,
+            modifier = Modifier
+                .size(260.dp)
+                .align(Alignment.Center)
+        )
 
         // Overlay to display head pose angles
         Column(
             modifier = Modifier
                 .padding(16.dp)
-                .background(Color.Green.copy(alpha = 0.5f))
+                .background(boxColor)
                 .padding(8.dp)
+                .align(Alignment.TopStart)
         ) {
             Text(
                 text = "Pitch: ${headPoseAngles.pitch.toInt()}°",
@@ -316,12 +347,17 @@ fun CameraWithHeadPose(modifier: Modifier = Modifier) {
                 fontSize = 20.sp
             )
             Text(
-                text = "YaRRRw: ${headPoseAngles.yaw.toInt()}°",
+                text = "Yaw: ${headPoseAngles.yaw.toInt()}°",
                 color = Color.White,
                 fontSize = 20.sp
             )
             Text(
                 text = "Roll: ${headPoseAngles.roll.toInt()}°",
+                color = Color.White,
+                fontSize = 20.sp
+            )
+            Text(
+                text = "Dist: $distanceEnforce",
                 color = Color.White,
                 fontSize = 20.sp
             )
